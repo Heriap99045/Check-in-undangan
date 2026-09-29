@@ -899,45 +899,121 @@
     try{
       const data = await file.arrayBuffer();
       const wb = XLSX.read(data, { type: 'array' });
-      const sheet = wb.Sheets[wb.SheetNames[0]];
-      const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
 
-      if(rows.length === 0){
-        showImportSummary('File kosong atau tidak ada baris data yang terbaca.');
+      const norm = (v)=> String(v == null ? '' : v).toLowerCase().replace(/[^a-z]/g,'');
+      const clean = (v)=> String(v == null ? '' : v).trim();
+
+      // Mengumpulkan data tamu dari workbook.
+      // Format 1 (utama): banyak sheet, tiap sheet berisi beberapa blok kelompok dengan baris judul "NO | NAMA | ALAMAT | KETERANGAN | NO WHATSAPP | KATEGORI".
+      // Format 2 (cadangan): satu tabel biasa dengan baris pertama sebagai judul kolom.
+      const records = [];
+      let blocksFound = 0;
+      let emptyNameRows = 0;
+
+      wb.SheetNames.forEach(sheetName=>{
+        if(sheetName.trim().toUpperCase() === 'JUMLAH') return; // sheet rekap, bukan daftar tamu
+        const grid = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, defval: '', raw: false });
+
+        // Baca baris demi baris: judul kolom -> judul kelompok -> tamu (baris bernomor urut).
+        // Baris kosong, baris TOTAL, dan blok tanpa baris judul kolom ikut ditangani.
+        let col = null;
+        let title = '';
+        let titleFresh = false;
+
+        for(let r = 0; r < grid.length; r++){
+          const row = grid[r];
+          const first = clean(row[0]);
+
+          // baris judul kolom
+          if(norm(first) === 'no'){
+            const map = {};
+            row.forEach((h, idx)=>{
+              const k = norm(h);
+              if(!k) return;
+              if(map.nama === undefined && (k.includes('nama') || k === 'name')) map.nama = idx;
+              else if(map.alamat === undefined && k.includes('alamat')) map.alamat = idx;
+              else if(map.ket === undefined && (k.includes('keterangan') || k.includes('catatan') || k.includes('notes'))) map.ket = idx;
+              else if(map.hp === undefined && (k.includes('whatsapp') || k.includes('hp') || k.includes('telepon') || k.includes('phone') || k === 'wa' || k.includes('nomor'))) map.hp = idx;
+              else if(map.kat === undefined && (k.includes('kategori') || k.includes('category'))) map.kat = idx;
+            });
+            if(map.nama !== undefined){
+              col = map;
+              blocksFound++;
+              if(!titleFresh) title = '';   // tidak ada judul kelompok baru di atas blok ini
+              titleFresh = false;
+            }
+            continue;
+          }
+          if(!col) continue;
+
+          // baris tamu: kolom NO berisi angka
+          if(/^\d+$/.test(first)){
+            const nama = clean(row[col.nama]);
+            if(!nama){ emptyNameRows++; continue; }
+            const kelompok = title ? `${sheetName} · ${title}` : sheetName;
+            const alamat = col.alamat !== undefined ? clean(row[col.alamat]) : '';
+            const ket = col.ket !== undefined ? clean(row[col.ket]) : '';
+            records.push({
+              nama,
+              phone: col.hp !== undefined ? clean(row[col.hp]) : '',
+              notes: [kelompok, alamat, ket].filter(Boolean).join(' · '),
+              kategoriRaw: col.kat !== undefined ? clean(row[col.kat]).toLowerCase() : ''
+            });
+            continue;
+          }
+
+          // baris judul kelompok: hanya satu sel berisi teks (bukan angka)
+          const filled = row.map(clean).filter(x => x);
+          if(filled.length === 1 && !/^\d+$/.test(filled[0]) && !/^(total|jumlah)$/i.test(filled[0])){
+            title = filled[0];
+            titleFresh = true;
+          }
+        }
+      });
+
+      // Cadangan: tabel biasa (baris pertama = judul kolom)
+      if(blocksFound === 0){
+        const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: '', raw: false });
+        const findKey = (row, patterns)=> Object.keys(row).find(k => patterns.some(p => norm(k).includes(p)));
+        rows.forEach(row=>{
+          const nameKey = findKey(row, ['nama','name']);
+          const phoneKey = findKey(row, ['hp','telepon','phone','wa','whatsapp','nomor']);
+          const notesKey = findKey(row, ['catatan','notes','keterangan','note']);
+          const kategoriKey = findKey(row, ['kategori','category','tipe','type']);
+          records.push({
+            nama: nameKey ? clean(row[nameKey]) : '',
+            phone: phoneKey ? clean(row[phoneKey]) : '',
+            notes: notesKey ? clean(row[notesKey]) : '',
+            kategoriRaw: kategoriKey ? clean(row[kategoriKey]).toLowerCase() : ''
+          });
+        });
+      }
+
+      if(records.length === 0){
+        showImportSummary('Tidak ada data tamu yang terbaca. Pastikan ada kolom "NAMA" (dan opsional "NO WHATSAPP" & "KATEGORI").');
         return;
       }
 
-      const findKey = (row, patterns)=>{
-        const keys = Object.keys(row);
-        return keys.find(k => patterns.some(p => k.toLowerCase().replace(/[^a-z]/g,'').includes(p)));
-      };
-
-      let added = 0, skippedDupe = 0, skippedEmpty = 0, addedOffline = 0, addedOnline = 0;
+      let added = 0, skippedDupe = 0, skippedEmpty = 0, addedOffline = 0, addedOnline = 0, kategoriKosong = 0;
       const newForRemote = {};
 
-      rows.forEach(row=>{
-        const nameKey = findKey(row, ['nama','name']);
-        const phoneKey = findKey(row, ['hp','telepon','phone','wa','whatsapp','nomor']);
-        const notesKey = findKey(row, ['catatan','notes','keterangan','note']);
-        const kategoriKey = findKey(row, ['kategori','category','tipe','type']);
-
-        const nama = nameKey ? String(row[nameKey]).trim() : '';
-        const phone = phoneKey ? String(row[phoneKey]).trim() : '';
-        const notes = notesKey ? String(row[notesKey]).trim() : '';
-        const kategoriRaw = kategoriKey ? String(row[kategoriKey]).trim().toLowerCase() : '';
-        const kategori = kategoriRaw.startsWith('off') ? 'offline' : 'online';
-
+      records.forEach(rec=>{
+        const { nama, phone, notes, kategoriRaw } = rec;
         if(!nama){ skippedEmpty++; return; }
 
+        const kategori = kategoriRaw.startsWith('off') ? 'offline' : 'online';
+        if(!kategoriRaw) kategoriKosong++;
+
+        // dianggap dobel bila nama + catatan (kelompok/alamat) sama, atau nama + nomor HP sama
         const dupe = state.guests.some(g =>
           g.nama.toLowerCase() === nama.toLowerCase() &&
-          (phone ? normalizePhone(g.phone) === normalizePhone(phone) : true)
+          ( (g.notes || '') === notes ||
+            (phone && g.phone && normalizePhone(g.phone) === normalizePhone(phone)) )
         );
         if(dupe){ skippedDupe++; return; }
 
         const newId = uid();
-        const guestObj = { id: newId, nama, phone, notes, kategori, sent: false, checkedIn: false, checkinTime: null };
-        state.guests.push(guestObj);
+        state.guests.push({ id: newId, nama, phone, notes, kategori, sent: false, checkedIn: false, checkinTime: null });
         newForRemote[newId] = { nama, phone, notes, kategori, sent:false, checkedIn:false, checkinTime:null };
         added++;
         if(kategori === 'offline') addedOffline++; else addedOnline++;
@@ -949,12 +1025,11 @@
       }
       renderAll();
 
-      let msg = `${added} tamu berhasil ditambahkan dari file (${addedOnline} online, ${addedOffline} offline).`;
+      let msg = `${added} tamu berhasil ditambahkan (${addedOnline} online, ${addedOffline} offline).`;
+      if(blocksFound) msg += ` Terbaca dari ${blocksFound} kelompok di file.`;
+      if(kategoriKosong) msg += ` ${kategoriKosong} tamu kolom KATEGORI-nya kosong, otomatis dianggap Online.`;
       if(skippedDupe) msg += ` ${skippedDupe} dilewati karena sudah ada di daftar.`;
-      if(skippedEmpty) msg += ` ${skippedEmpty} baris dilewati karena kolom nama kosong.`;
-      if(added === 0 && skippedEmpty === rows.length){
-        msg = 'Tidak ada kolom nama yang terbaca. Pastikan file punya kolom berjudul "Nama" (kolom "No HP" dan "Catatan" bersifat opsional).';
-      }
+      if(skippedEmpty + emptyNameRows) msg += ` ${skippedEmpty + emptyNameRows} baris dilewati karena nama kosong.`;
       showImportSummary(msg);
     }catch(err){
       console.error(err);
