@@ -652,7 +652,7 @@
   function toGuestsObj(list){
     const obj = {};
     list.forEach(g=>{
-      obj[g.id] = { nama:g.nama, phone:g.phone||"", notes:g.notes||"", kategori:g.kategori||"online", sent:!!g.sent, checkedIn:!!g.checkedIn, checkinTime:g.checkinTime||null };
+      obj[g.id] = { nama:g.nama, phone:g.phone||"", notes:g.notes||"", kelompok:g.kelompok||"", kategori:g.kategori||"online", sent:!!g.sent, checkedIn:!!g.checkedIn, checkinTime:g.checkinTime||null };
     });
     return obj;
   }
@@ -957,6 +957,7 @@
               nama,
               phone: col.hp !== undefined ? clean(row[col.hp]) : '',
               notes: [kelompok, alamat, ket].filter(Boolean).join(' · '),
+              kelompok,
               kategoriRaw: col.kat !== undefined ? clean(row[col.kat]).toLowerCase() : ''
             });
             continue;
@@ -984,6 +985,7 @@
             nama: nameKey ? clean(row[nameKey]) : '',
             phone: phoneKey ? clean(row[phoneKey]) : '',
             notes: notesKey ? clean(row[notesKey]) : '',
+            kelompok: notesKey ? clean(row[notesKey]) : '',
             kategoriRaw: kategoriKey ? clean(row[kategoriKey]).toLowerCase() : ''
           });
         });
@@ -994,41 +996,60 @@
         return;
       }
 
-      let added = 0, skippedDupe = 0, skippedEmpty = 0, addedOffline = 0, addedOnline = 0, kategoriKosong = 0;
+      let added = 0, updated = 0, unchanged = 0, skippedEmpty = 0, addedOffline = 0, addedOnline = 0, kategoriKosong = 0;
       const newForRemote = {};
+      const updatedForRemote = {};
 
       records.forEach(rec=>{
-        const { nama, phone, notes, kategoriRaw } = rec;
+        const { nama, phone, notes, kategoriRaw, kelompok } = rec;
         if(!nama){ skippedEmpty++; return; }
 
         const kategori = kategoriRaw.startsWith('off') ? 'offline' : 'online';
         if(!kategoriRaw) kategoriKosong++;
 
-        // dianggap dobel bila nama + catatan (kelompok/alamat) sama, atau nama + nomor HP sama
-        const dupe = state.guests.some(g =>
-          g.nama.toLowerCase() === nama.toLowerCase() &&
-          ( (g.notes || '') === notes ||
-            (phone && g.phone && normalizePhone(g.phone) === normalizePhone(phone)) )
+        // tamu yang sama dikenali dari nama + kelompok asalnya (sheet & judul kelompok di Excel),
+        // supaya perubahan ejaan nama tidak dianggap orang baru, tapi tetap membedakan nama
+        // yang sama persis di kelompok yang berbeda.
+        const existing = state.guests.find(g =>
+          g.nama.toLowerCase() === nama.toLowerCase() && (g.kelompok || '') === (kelompok || '')
         );
-        if(dupe){ skippedDupe++; return; }
+
+        if(existing){
+          let changed = false;
+          if(phone && phone !== existing.phone){ existing.phone = phone; changed = true; }
+          if(notes !== existing.notes){ existing.notes = notes; changed = true; }
+          if(kategoriRaw && kategori !== existing.kategori){ existing.kategori = kategori; changed = true; }
+          if(changed){
+            updated++;
+            updatedForRemote[existing.id] = {
+              nama: existing.nama, phone: existing.phone || '', notes: existing.notes || '',
+              kelompok: existing.kelompok || '', kategori: existing.kategori || 'online',
+              sent: !!existing.sent, checkedIn: !!existing.checkedIn, checkinTime: existing.checkinTime || null
+            };
+          } else {
+            unchanged++;
+          }
+          return;
+        }
 
         const newId = uid();
-        state.guests.push({ id: newId, nama, phone, notes, kategori, sent: false, checkedIn: false, checkinTime: null });
-        newForRemote[newId] = { nama, phone, notes, kategori, sent:false, checkedIn:false, checkinTime:null };
+        state.guests.push({ id: newId, nama, phone, notes, kelompok, kategori, sent: false, checkedIn: false, checkinTime: null });
+        newForRemote[newId] = { nama, phone, notes, kelompok, kategori, sent:false, checkedIn:false, checkinTime:null };
         added++;
         if(kategori === 'offline') addedOffline++; else addedOnline++;
       });
 
       await saveData();
-      if(getDbUrl() && Object.keys(newForRemote).length){
-        await remotePatch('/guests', newForRemote);
+      if(getDbUrl() && (Object.keys(newForRemote).length || Object.keys(updatedForRemote).length)){
+        await remotePatch('/guests', Object.assign({}, newForRemote, updatedForRemote));
       }
       renderAll();
 
-      let msg = `${added} tamu berhasil ditambahkan (${addedOnline} online, ${addedOffline} offline).`;
+      let msg = `${added} tamu baru ditambahkan (${addedOnline} online, ${addedOffline} offline).`;
+      if(updated) msg += ` ${updated} tamu diperbarui datanya.`;
       if(blocksFound) msg += ` Terbaca dari ${blocksFound} kelompok di file.`;
       if(kategoriKosong) msg += ` ${kategoriKosong} tamu kolom KATEGORI-nya kosong, otomatis dianggap Online.`;
-      if(skippedDupe) msg += ` ${skippedDupe} dilewati karena sudah ada di daftar.`;
+      if(unchanged) msg += ` ${unchanged} tidak ada perubahan.`;
       if(skippedEmpty + emptyNameRows) msg += ` ${skippedEmpty + emptyNameRows} baris dilewati karena nama kosong.`;
       showImportSummary(msg);
     }catch(err){
@@ -1183,6 +1204,20 @@
     bg.onload = function(){
       ctx.clearRect(0, 0, CARD_W, CARD_H);
       ctx.drawImage(bg, 0, 0, CARD_W, CARD_H);
+
+      // nama tamu di bawah judul "Barcode Kehadiran", pakai font serif yang sama (Fraunces),
+      // ukuran otomatis mengecil kalau namanya panjang supaya tetap muat satu baris.
+      const label = g.nama;
+      let fontSize = 46;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      do{
+        ctx.font = '600 ' + fontSize + 'px Fraunces, serif';
+        fontSize -= 2;
+      } while(ctx.measureText(label).width > CARD_W - 160 && fontSize > 22);
+      ctx.fillStyle = '#FFFFFF';
+      // tepat di tengah celah antara judul "Barcode Kehadiran" (berakhir ~y283) dan kotak QR (mulai y424)
+      ctx.fillText(label, CARD_W / 2, 354);
 
       const qrImg = new Image();
       qrImg.onload = function(){
