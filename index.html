@@ -126,6 +126,17 @@
   }
   .tag-kategori.online{background:#DDEAF7;color:#1F5C8B;}
   .tag-kategori.offline{background:var(--paper-dim);color:var(--ink-soft);}
+  .vip-star{
+    cursor:pointer;font-size:19px;line-height:1;color:#D9D2BE;
+    user-select:none;transition:color .15s,transform .15s;display:inline-block;
+  }
+  .vip-star:hover{transform:scale(1.15);}
+  .vip-star.on{color:#D4A017;}
+  .tag-vip{
+    display:inline-flex;align-items:center;gap:3px;font-size:11px;font-weight:700;
+    padding:2px 8px;border-radius:999px;letter-spacing:.3px;text-transform:uppercase;
+    background:#FBEEC8;color:#8A6A10;
+  }
   .guest-actions{display:flex;gap:6px;flex-shrink:0;}
   .icon-action{
     width:34px;height:34px;border-radius:7px;border:1px solid var(--line);
@@ -400,7 +411,7 @@
 <!-- MODAL: Add guest -->
 <div class="overlay" id="addGuestOverlay">
   <div class="modal">
-    <h3>Tambah Tamu</h3>
+    <h3 id="guestModalTitle">Tambah Tamu</h3>
     <div class="field"><label>Nama tamu</label><input type="text" id="fNama" placeholder="Nama lengkap"></div>
     <div class="field"><label>Nomor WhatsApp</label><input type="text" id="fPhone" placeholder="08xxxxxxxxxx"></div>
     <div class="field"><label>Catatan (opsional)</label><input type="text" id="fNotes" placeholder="Misal: 2 orang, meja VIP"></div>
@@ -410,6 +421,12 @@
         <option value="online">Online — kirim undangan via WhatsApp</option>
         <option value="offline">Offline — cetak kartu fisik saja</option>
       </select>
+    </div>
+    <div class="field">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+        <input type="checkbox" id="fVip" style="width:17px;height:17px;">
+        ⭐ Tandai sebagai VIP
+      </label>
     </div>
     <div class="modal-actions">
       <button class="ghost-btn" data-close="addGuestOverlay">Batal</button>
@@ -652,7 +669,7 @@
   function toGuestsObj(list){
     const obj = {};
     list.forEach(g=>{
-      obj[g.id] = { nama:g.nama, phone:g.phone||"", notes:g.notes||"", kelompok:g.kelompok||"", kategori:g.kategori||"online", sent:!!g.sent, checkedIn:!!g.checkedIn, checkinTime:g.checkinTime||null };
+      obj[g.id] = { nama:g.nama, phone:g.phone||"", notes:g.notes||"", kelompok:g.kelompok||"", kategori:g.kategori||"online", vip:!!g.vip, sent:!!g.sent, checkedIn:!!g.checkedIn, checkinTime:g.checkinTime||null };
     });
     return obj;
   }
@@ -1083,25 +1100,61 @@
     toast('Daftar tamu diekspor');
   });
 
-  /* ---------- ADD GUEST ---------- */
+  /* ---------- ADD / EDIT GUEST ---------- */
+  let editingGuestId = null;
+
   document.getElementById('addGuestBtn').addEventListener('click', ()=>{
+    editingGuestId = null;
+    document.getElementById('guestModalTitle').textContent = 'Tambah Tamu';
+    document.getElementById('saveGuestBtn').textContent = 'Simpan';
     document.getElementById('fNama').value = '';
     document.getElementById('fPhone').value = '';
     document.getElementById('fNotes').value = '';
     document.getElementById('fKategori').value = 'online';
+    document.getElementById('fVip').checked = false;
     openModal('addGuestOverlay');
     document.getElementById('fNama').focus();
   });
+
+  function openEditGuestModal(guestId){
+    const g = state.guests.find(x=>x.id===guestId);
+    if(!g) return;
+    editingGuestId = g.id;
+    document.getElementById('guestModalTitle').textContent = 'Edit Tamu';
+    document.getElementById('saveGuestBtn').textContent = 'Simpan Perubahan';
+    document.getElementById('fNama').value = g.nama || '';
+    document.getElementById('fPhone').value = g.phone || '';
+    document.getElementById('fNotes').value = g.notes || '';
+    document.getElementById('fKategori').value = g.kategori || 'online';
+    document.getElementById('fVip').checked = !!g.vip;
+    openModal('addGuestOverlay');
+    document.getElementById('fNama').focus();
+  }
+
   document.getElementById('saveGuestBtn').addEventListener('click', async ()=>{
     const nama = document.getElementById('fNama').value.trim();
     const phone = document.getElementById('fPhone').value.trim();
     const notes = document.getElementById('fNotes').value.trim();
     const kategori = document.getElementById('fKategori').value;
+    const vip = document.getElementById('fVip').checked;
     if(!nama){ toast('Nama tamu wajib diisi', 'err'); return; }
-    const newGuest = { id: uid(), nama, phone, notes, kategori, sent: false, checkedIn: false, checkinTime: null };
+
+    if(editingGuestId){
+      const g = state.guests.find(x=>x.id===editingGuestId);
+      if(!g){ closeModal('addGuestOverlay'); return; }
+      g.nama = nama; g.phone = phone; g.notes = notes; g.kategori = kategori; g.vip = vip;
+      await saveData();
+      if(getDbUrl()) await remotePatch(`/guests/${g.id}`, { nama, phone, notes, kategori, vip });
+      renderAll();
+      closeModal('addGuestOverlay');
+      toast('Perubahan disimpan');
+      return;
+    }
+
+    const newGuest = { id: uid(), nama, phone, notes, kategori, vip, sent: false, checkedIn: false, checkinTime: null };
     state.guests.push(newGuest);
     await saveData();
-    if(getDbUrl()) await remotePut(`/guests/${newGuest.id}`, { nama, phone, notes, kategori, sent:false, checkedIn:false, checkinTime:null });
+    if(getDbUrl()) await remotePut(`/guests/${newGuest.id}`, { nama, phone, notes, kategori, vip, sent:false, checkedIn:false, checkinTime:null });
     renderAll();
     closeModal('addGuestOverlay');
     toast('Tamu ditambahkan');
@@ -1126,7 +1179,12 @@
       <div class="guest-card">
         <span class="dot ${g.sent ? 'green' : 'red'}" title="${g.sent ? 'Sudah dikirim' : 'Belum dikirim'}"></span>
         <div class="guest-info">
-          <div class="name">${escapeHtml(g.nama)} <span class="tag-kategori ${kategori}">${kategori === 'offline' ? 'Offline' : 'Online'}</span></div>
+          <div class="name">
+            <span class="vip-star ${g.vip ? 'on' : ''}" data-action="togglevip" data-id="${g.id}" title="${g.vip ? 'Klik untuk hapus tanda VIP' : 'Klik untuk tandai VIP'}">★</span>
+            ${escapeHtml(g.nama)}
+            ${g.vip ? '<span class="tag-vip">VIP</span>' : ''}
+            <span class="tag-kategori ${kategori}">${kategori === 'offline' ? 'Offline' : 'Online'}</span>
+          </div>
           <div class="meta">
             <span>${g.phone ? escapeHtml(g.phone) : 'Tanpa nomor HP'}</span>
             ${g.notes ? `<span>· ${escapeHtml(g.notes)}</span>` : ''}
@@ -1136,6 +1194,9 @@
         <div class="guest-actions">
           <button class="icon-action" data-action="card" data-id="${g.id}" title="Kartu undangan">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M3 10h18M8 4v6"></path></svg>
+          </button>
+          <button class="icon-action" data-action="edit" data-id="${g.id}" title="Edit tamu">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"></path><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>
           </button>
           <button class="icon-action danger" data-action="delete" data-id="${g.id}" title="Hapus">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0-1 14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2L4 6"></path></svg>
@@ -1147,6 +1208,19 @@
 
     list.querySelectorAll('[data-action="card"]').forEach(b=>{
       b.addEventListener('click', ()=> openCardModal(b.dataset.id));
+    });
+    list.querySelectorAll('[data-action="edit"]').forEach(b=>{
+      b.addEventListener('click', ()=> openEditGuestModal(b.dataset.id));
+    });
+    list.querySelectorAll('[data-action="togglevip"]').forEach(b=>{
+      b.addEventListener('click', async ()=>{
+        const g = state.guests.find(x=>x.id===b.dataset.id);
+        if(!g) return;
+        g.vip = !g.vip;
+        await saveData();
+        if(getDbUrl()) await remotePatch(`/guests/${g.id}`, { vip: g.vip });
+        renderAll();
+      });
     });
     list.querySelectorAll('[data-action="delete"]').forEach(b=>{
       b.addEventListener('click', ()=>{
