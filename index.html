@@ -132,6 +132,11 @@
   }
   .vip-star:hover{transform:scale(1.15);}
   .vip-star.on{color:#D4A017;}
+  .dup-item{border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:var(--paper);}
+  .dup-item .dup-name{font-weight:700;font-size:15px;margin-bottom:6px;color:var(--ink);}
+  .dup-item .dup-info{font-size:12.5px;color:var(--ink-soft);line-height:1.5;}
+  .dup-item .dup-choices{display:flex;flex-direction:column;gap:6px;margin-top:10px;font-size:13.5px;}
+  .dup-item .dup-choices label{display:flex;align-items:center;gap:8px;cursor:pointer;}
   .tag-vip{
     display:inline-flex;align-items:center;gap:3px;font-size:11px;font-weight:700;
     padding:2px 8px;border-radius:999px;letter-spacing:.3px;text-transform:uppercase;
@@ -509,6 +514,23 @@
   </div>
 </div>
 
+<!-- MODAL: Konfirmasi nama ganda saat impor -->
+<div class="overlay" id="dupOverlay">
+  <div class="modal" style="max-width:620px;">
+    <h3>Konfirmasi Nama Ganda</h3>
+    <p id="dupIntro" style="font-size:13.5px;color:var(--ink-soft);margin:0 0 12px;line-height:1.5;"></p>
+    <div style="display:flex;gap:8px;margin-bottom:10px;">
+      <button class="ghost-btn" id="dupAllDifferent" style="padding:6px 10px;font-size:12.5px;">Semua: orang berbeda</button>
+      <button class="ghost-btn" id="dupAllSame" style="padding:6px 10px;font-size:12.5px;">Semua: orang yang sama</button>
+    </div>
+    <div id="dupList" style="max-height:48vh;overflow-y:auto;display:flex;flex-direction:column;gap:10px;"></div>
+    <div class="modal-actions">
+      <button class="ghost-btn" id="dupCancelBtn">Batal Impor</button>
+      <button class="primary-btn" id="dupOkBtn">Lanjutkan Impor</button>
+    </div>
+  </div>
+</div>
+
 <!-- MODAL: Confirm -->
 <div class="overlay" id="confirmOverlay">
   <div class="modal">
@@ -560,6 +582,7 @@
       template: "Halo {nama}! 🎉\n\nAnda diundang ke *{acara}*\n📅 {tanggal} pukul {waktu}\n📍 {lokasi}\n\nMohon tunjukkan kartu undangan (QR code) ini saat check-in di lokasi acara.\n\nSampai jumpa!\n{tuanrumah}"
     },
     auth: { username: "", passHash: "" },
+    dupDecisions: {},
     guests: []
   };
 
@@ -574,6 +597,7 @@
         const parsed = JSON.parse(raw);
         state.settings = Object.assign(state.settings, parsed.settings || {});
         state.auth = Object.assign(state.auth, parsed.auth || {});
+        state.dupDecisions = parsed.dupDecisions || {};
         state.guests = parsed.guests || [];
       }
     }catch(e){
@@ -845,17 +869,23 @@
   function openModal(id){ document.getElementById(id).classList.add('show'); }
   function closeModal(id){ document.getElementById(id).classList.remove('show'); }
 
-  function askConfirm(message, onConfirm){
+  let confirmCallback = null;
+  function askConfirm(message, onConfirm, opts){
+    opts = opts || {};
+    document.getElementById('confirmTitle').textContent = opts.title || 'Konfirmasi';
     document.getElementById('confirmMsg').textContent = message;
-    openModal('confirmOverlay');
     const yesBtn = document.getElementById('confirmYesBtn');
-    const handler = ()=>{
-      closeModal('confirmOverlay');
-      yesBtn.removeEventListener('click', handler);
-      onConfirm();
-    };
-    yesBtn.addEventListener('click', handler);
+    yesBtn.textContent = opts.yesLabel || 'Hapus';
+    yesBtn.style.background = opts.danger === false ? '' : 'var(--red)';
+    confirmCallback = onConfirm;
+    openModal('confirmOverlay');
   }
+  document.getElementById('confirmYesBtn').addEventListener('click', ()=>{
+    const cb = confirmCallback;
+    confirmCallback = null;
+    closeModal('confirmOverlay');
+    if(cb) cb();
+  });
   document.querySelectorAll('[data-close]').forEach(b=>{
     b.addEventListener('click', ()=>{ closeModal(b.dataset.close); setTimeout(()=>{ if(typeof focusHwInput==='function') focusHwInput(); }, 50); });
   });
@@ -1013,45 +1043,89 @@
         return;
       }
 
-      let added = 0, updated = 0, unchanged = 0, skippedEmpty = 0, addedOffline = 0, addedOnline = 0, kategoriKosong = 0;
-      const newForRemote = {};
-      const updatedForRemote = {};
+      const normName = (v)=> String(v == null ? '' : v).toLowerCase().replace(/\s+/g, ' ').trim();
 
+      let skippedEmpty = 0, kategoriKosong = 0;
+      const claimed = new Set();     // tamu lama yang sudah dipasangkan dengan satu baris Excel
+      const planUpdates = [];        // baris Excel yang cocok dengan tamu yang sudah ada
+      const planAdds = [];           // baris Excel yang akan jadi tamu baru
+      const pending = [];            // baris dengan nama ganda yang perlu dikonfirmasi
+      const simulated = [];          // calon tamu baru dari file ini (untuk mendeteksi nama ganda antar baris)
+      let dupSame = 0, dupDifferent = 0;
+
+      // TAHAP 1 — susun rencana tanpa mengubah data
       records.forEach(rec=>{
-        const { nama, phone, notes, kategoriRaw, kelompok } = rec;
-        if(!nama){ skippedEmpty++; return; }
+        if(!rec.nama){ skippedEmpty++; return; }
+        const kategori = rec.kategoriRaw.startsWith('off') ? 'offline' : 'online';
+        if(!rec.kategoriRaw) kategoriKosong++;
 
-        const kategori = kategoriRaw.startsWith('off') ? 'offline' : 'online';
-        if(!kategoriRaw) kategoriKosong++;
-
-        // tamu yang sama dikenali dari nama + kelompok asalnya (sheet & judul kelompok di Excel),
-        // supaya perubahan ejaan nama tidak dianggap orang baru, tapi tetap membedakan nama
-        // yang sama persis di kelompok yang berbeda.
+        // tamu yang sama dikenali dari nama + kelompok asal (sheet & judul kelompok di Excel).
+        // Satu tamu lama hanya boleh dipasangkan dengan satu baris, jadi nama kembar dalam
+        // satu kelompok tidak lagi diam-diam tergabung.
         const existing = state.guests.find(g =>
-          g.nama.toLowerCase() === nama.toLowerCase() && (g.kelompok || '') === (kelompok || '')
+          !claimed.has(g.id) && normName(g.nama) === normName(rec.nama) && (g.kelompok || '') === (rec.kelompok || '')
         );
-
         if(existing){
-          let changed = false;
-          if(phone && phone !== existing.phone){ existing.phone = phone; changed = true; }
-          if(notes !== existing.notes){ existing.notes = notes; changed = true; }
-          if(kategoriRaw && kategori !== existing.kategori){ existing.kategori = kategori; changed = true; }
-          if(changed){
-            updated++;
-            updatedForRemote[existing.id] = {
-              nama: existing.nama, phone: existing.phone || '', notes: existing.notes || '',
-              kelompok: existing.kelompok || '', kategori: existing.kategori || 'online',
-              sent: !!existing.sent, checkedIn: !!existing.checkedIn, checkinTime: existing.checkinTime || null
-            };
-          } else {
-            unchanged++;
-          }
+          claimed.add(existing.id);
+          planUpdates.push({ guest: existing, rec, kategori });
           return;
         }
 
-        const newId = uid();
-        state.guests.push({ id: newId, nama, phone, notes, kelompok, kategori, sent: false, checkedIn: false, checkinTime: null });
-        newForRemote[newId] = { nama, phone, notes, kelompok, kategori, sent:false, checkedIn:false, checkinTime:null };
+        // calon tamu baru: kalau namanya sudah ada (di daftar tamu atau baris lain di file), minta konfirmasi
+        const other = state.guests.find(g => normName(g.nama) === normName(rec.nama))
+                   || simulated.find(x => normName(x.nama) === normName(rec.nama));
+        if(other){
+          const key = normName(rec.nama) + '||' + (rec.kelompok || '') + '||' + (other.kelompok || '');
+          const remembered = (state.dupDecisions || {})[key];
+          if(remembered === 'same'){ dupSame++; return; }
+          if(remembered !== 'different'){
+            pending.push({ rec, kategori, other, key });
+            simulated.push({ nama: rec.nama, kelompok: rec.kelompok, notes: rec.notes, src: 'excel' });
+            return;
+          }
+          dupDifferent++;
+        }
+        planAdds.push({ rec, kategori });
+        simulated.push({ nama: rec.nama, kelompok: rec.kelompok, notes: rec.notes, src: 'excel' });
+      });
+
+      // TAHAP 2 — tanyakan nama ganda (kalau ada)
+      if(pending.length){
+        const choices = await askDuplicates(pending);
+        if(!choices){
+          showImportSummary('Impor dibatalkan. Belum ada data yang diubah.');
+          return;
+        }
+        state.dupDecisions = state.dupDecisions || {};
+        pending.forEach((p, i)=>{
+          state.dupDecisions[p.key] = choices[i];
+          if(choices[i] === 'different'){ planAdds.push({ rec: p.rec, kategori: p.kategori }); dupDifferent++; }
+          else { dupSame++; }
+        });
+      }
+
+      // TAHAP 3 — terapkan perubahan
+      let added = 0, updated = 0, unchanged = 0, addedOffline = 0, addedOnline = 0;
+      const newForRemote = {};
+      const updatedForRemote = {};
+
+      planUpdates.forEach(({ guest: existing, rec, kategori })=>{
+        let changed = false;
+        if(rec.phone && rec.phone !== existing.phone){ existing.phone = rec.phone; changed = true; }
+        if(rec.notes !== existing.notes){ existing.notes = rec.notes; changed = true; }
+        if(rec.kategoriRaw && kategori !== existing.kategori){ existing.kategori = kategori; changed = true; }
+        if(changed){
+          updated++;
+          updatedForRemote[existing.id] = toGuestsObj([existing])[existing.id];
+        } else {
+          unchanged++;
+        }
+      });
+
+      planAdds.forEach(({ rec, kategori })=>{
+        const g = { id: uid(), nama: rec.nama, phone: rec.phone, notes: rec.notes, kelompok: rec.kelompok, kategori, vip: false, sent: false, checkedIn: false, checkinTime: null };
+        state.guests.push(g);
+        newForRemote[g.id] = toGuestsObj([g])[g.id];
         added++;
         if(kategori === 'offline') addedOffline++; else addedOnline++;
       });
@@ -1064,6 +1138,8 @@
 
       let msg = `${added} tamu baru ditambahkan (${addedOnline} online, ${addedOffline} offline).`;
       if(updated) msg += ` ${updated} tamu diperbarui datanya.`;
+      if(dupDifferent) msg += ` ${dupDifferent} nama ganda dikonfirmasi sebagai orang berbeda (tetap masuk).`;
+      if(dupSame) msg += ` ${dupSame} nama ganda dikonfirmasi orang yang sama (tidak ditambahkan lagi).`;
       if(blocksFound) msg += ` Terbaca dari ${blocksFound} kelompok di file.`;
       if(kategoriKosong) msg += ` ${kategoriKosong} tamu kolom KATEGORI-nya kosong, otomatis dianggap Online.`;
       if(unchanged) msg += ` ${unchanged} tidak ada perubahan.`;
@@ -1074,6 +1150,55 @@
       showImportSummary('Gagal membaca file. Pastikan formatnya .xlsx, .xls, atau .csv.');
     }
   });
+
+  // Menampilkan modal konfirmasi nama ganda. Mengembalikan array 'different'/'same' (urut sama dengan list), atau null jika dibatalkan.
+  function askDuplicates(list){
+    return new Promise(resolve=>{
+      const overlay = document.getElementById('dupOverlay');
+      const box = document.getElementById('dupList');
+      document.getElementById('dupIntro').textContent =
+        `Ditemukan ${list.length} nama yang sama dengan tamu lain. Pilih apakah itu orang yang sama (tidak ditambahkan lagi) atau orang berbeda (tetap ditambahkan).`;
+
+      const describeOther = (o)=> (o.notes || o.kelompok || '—') + (o.src === 'excel' ? '  (baris lain di Excel)' : '  (sudah di daftar tamu)');
+      box.innerHTML = list.map((p, i)=>`
+        <div class="dup-item">
+          <div class="dup-name">${escapeHtml(p.rec.nama)}</div>
+          <div class="dup-info"><b>Baris ini:</b> ${escapeHtml(p.rec.notes || p.rec.kelompok || '—')}</div>
+          <div class="dup-info"><b>Sudah ada:</b> ${escapeHtml(describeOther(p.other))}</div>
+          <div class="dup-choices">
+            <label><input type="radio" name="dup_${i}" value="different" checked> Orang berbeda — tetap tambahkan</label>
+            <label><input type="radio" name="dup_${i}" value="same"> Orang yang sama — jangan tambahkan</label>
+          </div>
+        </div>`).join('');
+
+      const setAll = (val)=> box.querySelectorAll(`input[type=radio][value="${val}"]`).forEach(r => r.checked = true);
+      const btnDiff = document.getElementById('dupAllDifferent');
+      const btnSame = document.getElementById('dupAllSame');
+      const btnOk = document.getElementById('dupOkBtn');
+      const btnCancel = document.getElementById('dupCancelBtn');
+
+      const cleanup = ()=>{
+        btnDiff.onclick = btnSame.onclick = btnOk.onclick = btnCancel.onclick = null;
+        overlay.removeEventListener('click', onOutside);
+        overlay.classList.remove('show');
+      };
+      const onOutside = (e)=>{ if(e.target === overlay){ cleanup(); resolve(null); } };
+
+      btnDiff.onclick = ()=> setAll('different');
+      btnSame.onclick = ()=> setAll('same');
+      btnCancel.onclick = ()=>{ cleanup(); resolve(null); };
+      btnOk.onclick = ()=>{
+        const result = list.map((_, i)=>{
+          const sel = box.querySelector(`input[name="dup_${i}"]:checked`);
+          return sel ? sel.value : 'different';
+        });
+        cleanup();
+        resolve(result);
+      };
+      overlay.addEventListener('click', onOutside);
+      overlay.classList.add('show');
+    });
+  }
 
   function showImportSummary(msg){
     document.getElementById('importSummary').textContent = msg;
@@ -1151,13 +1276,29 @@
       return;
     }
 
-    const newGuest = { id: uid(), nama, phone, notes, kategori, vip, sent: false, checkedIn: false, checkinTime: null };
-    state.guests.push(newGuest);
-    await saveData();
-    if(getDbUrl()) await remotePut(`/guests/${newGuest.id}`, { nama, phone, notes, kategori, vip, sent:false, checkedIn:false, checkinTime:null });
-    renderAll();
-    closeModal('addGuestOverlay');
-    toast('Tamu ditambahkan');
+    const doAdd = async ()=>{
+      const newGuest = { id: uid(), nama, phone, notes, kategori, vip, sent: false, checkedIn: false, checkinTime: null };
+      state.guests.push(newGuest);
+      await saveData();
+      if(getDbUrl()) await remotePut(`/guests/${newGuest.id}`, toGuestsObj([newGuest])[newGuest.id]);
+      renderAll();
+      closeModal('addGuestOverlay');
+      toast('Tamu ditambahkan');
+    };
+
+    // nama yang sama sudah ada? minta konfirmasi dulu
+    const normN = (v)=> String(v || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const sameName = state.guests.find(g => normN(g.nama) === normN(nama));
+    if(sameName){
+      const info = sameName.notes || sameName.kelompok || 'tanpa keterangan';
+      askConfirm(
+        `Nama "${nama}" sudah ada di daftar (${info}). Apakah ini orang yang berbeda dan tetap mau ditambahkan?`,
+        doAdd,
+        { title: 'Nama Ganda', yesLabel: 'Ya, tambahkan', danger: false }
+      );
+      return;
+    }
+    await doAdd();
   });
 
   /* ---------- GUEST LIST RENDER ---------- */
